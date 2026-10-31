@@ -198,6 +198,53 @@ func expectGlobalRectToReResolveOffsetZero(t *testing.T, expired func(args []any
 	}
 }
 
+// Offset.zero comes from the static getter on the Offset class, whose id never
+// expires, so the lookup doesn't depend on which instances the heap holds.
+func TestOffsetZeroIDUsesTheStaticGetter(t *testing.T) {
+	vm := dialFakeVM(t, func(method string, params map[string]any) (any, *vmRPCError) {
+		if method == "invoke" && params["targetId"] == "classes/offset" && params["selector"] == "get:zero" {
+			return map[string]any{"id": "objects/zero", "class": map[string]any{"name": "Offset"}}, nil
+		}
+		return nil, &vmRPCError{Code: -32000, Message: "unexpected call " + method}
+	})
+
+	id, err := vm.offsetZeroID("classes/offset")
+	if err != nil || id != "objects/zero" {
+		t.Fatalf("offsetZeroID() = %q, %v; want objects/zero", id, err)
+	}
+}
+
+// Without the getter, Offset.zero is searched for among the live instances.
+// getInstances returns a capped sample, so when it holds no zero Offset the
+// search must look at all of them.
+func TestOffsetZeroIDSearchesAllInstancesWhenTheSampleHasNone(t *testing.T) {
+	vm := dialFakeVM(t, func(method string, params map[string]any) (any, *vmRPCError) {
+		switch method {
+		case "invoke":
+			return map[string]any{"type": "@Error", "kind": "UnhandledException", "id": "objects/error"}, nil
+		case "getInstances":
+			instances := []any{map[string]any{"id": "objects/one"}}
+			if limit, _ := params["limit"].(float64); limit < 500 {
+				instances = append(instances, map[string]any{"id": "objects/zero"})
+			}
+			return map[string]any{"totalCount": 2, "instances": instances}, nil
+		case "getObject":
+			switch params["objectId"] {
+			case "objects/one":
+				return fakeOffset("1.0", "0.0"), nil
+			case "objects/zero":
+				return fakeOffset("0.0", "0.0"), nil
+			}
+		}
+		return nil, &vmRPCError{Code: -32000, Message: "unexpected call " + method}
+	})
+
+	id, err := vm.offsetZeroID("classes/offset")
+	if err != nil || id != "objects/zero" {
+		t.Fatalf("offsetZeroID() = %q, %v; want objects/zero", id, err)
+	}
+}
+
 func TestIsExpiredArgumentErrorOnlyMatchesRejectedArgumentIds(t *testing.T) {
 	cases := map[error]bool{
 		&vmRPCError{Code: vmInvalidParams, Message: "Invalid params", Details: "invoke: invalid 'argumentIds' parameter: [objects/1/0]"}: true,

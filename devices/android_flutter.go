@@ -614,25 +614,65 @@ func (vm *flutterVM) firstInstance(classID string) (string, error) {
 	return r.Instances[0].ID, nil
 }
 
-// offsetZeroID finds the const Offset.zero on the heap (fields _dx/_dy == 0.0),
-// used as the point argument to RenderBox.localToGlobal.
+// offsetZeroID returns an object id for the const Offset.zero, used as the
+// point argument to RenderBox.localToGlobal. Invoking the static getter on the
+// class (whose id is fixed) takes one round trip and does not depend on which
+// instances the heap holds. A build without the getter (e.g. tree-shaken AOT)
+// falls back to searching the live Offset instances.
 func (vm *flutterVM) offsetZeroID(offsetClassID string) (string, error) {
-	raw, err := vm.call("getInstances", map[string]any{"isolateId": vm.isolateID, "objectId": offsetClassID, "limit": 500})
+	zero, err := vm.invoke(offsetClassID, "get:zero", nil)
+	if err == nil && zero.ID != "" && zero.className() == offsetClass {
+		return zero.ID, nil
+	}
+	// getInstances returns at most limit instances in no fixed order, so if the
+	// sample holds no zero Offset, look through all of them once.
+	ids, total, err := vm.instanceIDs(offsetClassID, 500)
 	if err != nil {
 		return "", err
 	}
+	if id := vm.firstZeroOffset(ids); id != "" {
+		return id, nil
+	}
+	if total > len(ids) {
+		if ids, _, err = vm.instanceIDs(offsetClassID, total); err != nil {
+			return "", err
+		}
+		if id := vm.firstZeroOffset(ids); id != "" {
+			return id, nil
+		}
+	}
+	return "", fmt.Errorf("offset.zero not found among live instances")
+}
+
+// instanceIDs returns up to limit live instances of a class, and how many exist.
+func (vm *flutterVM) instanceIDs(classID string, limit int) ([]string, int, error) {
+	raw, err := vm.call("getInstances", map[string]any{"isolateId": vm.isolateID, "objectId": classID, "limit": limit})
+	if err != nil {
+		return nil, 0, err
+	}
 	var r struct {
-		Instances []struct {
+		TotalCount int `json:"totalCount"`
+		Instances  []struct {
 			ID string `json:"id"`
 		} `json:"instances"`
 	}
 	if err := json.Unmarshal(raw, &r); err != nil {
-		return "", err
+		return nil, 0, err
 	}
-	// Inspect the instances concurrently — call() throttles the fan-out.
-	found := make([]string, len(r.Instances))
-	var wg sync.WaitGroup
+	ids := make([]string, len(r.Instances))
 	for i, inst := range r.Instances {
+		ids[i] = inst.ID
+	}
+	return ids, r.TotalCount, nil
+}
+
+// firstZeroOffset returns the first of ids whose fields _dx/_dy are both 0.0,
+// or "" if there is none.
+func (vm *flutterVM) firstZeroOffset(ids []string) string {
+	// Inspect the instances concurrently — call() throttles the fan-out.
+	found := make([]string, len(ids))
+	var wg sync.WaitGroup
+	for i, id := range ids {
 		wg.Add(1)
 		go func(i int, id string) {
 			defer wg.Done()
@@ -649,15 +689,15 @@ func (vm *flutterVM) offsetZeroID(offsetClassID string) (string, error) {
 			if okX && okY && x == 0 && y == 0 {
 				found[i] = id
 			}
-		}(i, inst.ID)
+		}(i, id)
 	}
 	wg.Wait()
 	for _, id := range found {
 		if id != "" {
-			return id, nil
+			return id
 		}
 	}
-	return "", fmt.Errorf("offset.zero not found among live instances")
+	return ""
 }
 
 // visit walks a render object subtree, returning the meaningful ScreenElements
